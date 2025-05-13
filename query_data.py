@@ -3,13 +3,14 @@ from langchain_chroma import Chroma
 from langchain.prompts import ChatPromptTemplate
 from langchain_openai import OpenAI
 from dotenv import load_dotenv
-
+from langchain_core.output_parsers import PydanticOutputParser
+from pydantic import BaseModel, Field, field_validator 
 from get_embedding_function import get_embedding_function
-
+from typing import List, Optional
 CHROMA_PATH = "chroma"
 
 PROMPT_TEMPLATE = """
-You are a helpful research assistant. Use the following context to answer the question as accurately and coherently as possible. If the context does not contain enough information, respond with "The context does not provide enough information to answer the question."
+You are a helpful research assistant. Use the following context to answer the question as accurately and coherently as possible. Keep your answer in a single paragraph and as related to the context as possible.
 
 Context:
 {context}
@@ -19,6 +20,9 @@ Context:
 Question: {question}
 
 Review the entire context, determine and use the most relevant information and return a direct, coherent and clear answer to the question. 
+
+{format_instructions}
+
 Answer:
 """
 
@@ -54,6 +58,25 @@ def main():
 #     print(formatted_response)
     # return response_text
 
+# Define Pydantic model for structured response parsing
+class RAGResponse(BaseModel):
+    """Schema for a structured RAG response."""
+    answer: str = Field(description="The answer to the user's question")
+    sources: List[str] = Field(description="List of document sources that support the answer")
+    confidence_score: Optional[float] = Field(
+        default=None, 
+        description="Confidence score between 0 and 1"
+    )
+    
+    # Update validator to use field_validator syntax for Pydantic v2
+    @field_validator('confidence_score')
+    def check_confidence_range(cls, v):
+        """Ensure confidence score is between 0 and 1"""
+        if v is not None and (v < 0 or v > 1):
+            return 0.5  # Default to middle value if out of range
+        return v
+# Create the parser
+parser = PydanticOutputParser(pydantic_object=RAGResponse)
 
 def query_rag(query_text: str):
     """Query the RAG system and return the response."""
@@ -67,10 +90,16 @@ def query_rag(query_text: str):
         
         # Prepare the context
         context_text = "\n\n---\n\n".join([doc.page_content for doc, _score in results])
+        # Get format instructions
+        format_instructions = parser.get_format_instructions()
         
-        # Format the prompt
+        # Format the prompt with format instructions
         prompt_template = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
-        prompt = prompt_template.format(context=context_text, question=query_text)
+        prompt = prompt_template.format(
+            context=context_text, 
+            question=query_text,
+            format_instructions=format_instructions
+        )
         
         # Invoke the model
         model = OpenAI(model="gpt-4o-mini", temperature=0)
@@ -78,12 +107,36 @@ def query_rag(query_text: str):
         
         # Extract sources
         sources = [doc.metadata.get("id", None) for doc, _score in results]
-        
-        # Format the response with sources
-        return f"{response_text}\n\nSources:\n" + "\n".join(sources)
+         
+        try:
+            # Try to parse the response
+            parsed_response = parser.parse(response_text)
+            
+            # If source information is missing, add it manually
+            if not parsed_response.sources:
+                parsed_response.sources = sources
+                
+            # Add a default confidence if not provided
+            if parsed_response.confidence_score is None:
+                parsed_response.confidence_score = 0.85
+                
+            return parsed_response
+            
+        except Exception as parsing_error:
+            # Fallback if parsing fails
+            print(f"Error parsing response: {parsing_error}")
+            return RAGResponse(
+                answer=response_text,
+                sources=sources,
+                confidence_score=0.7  # Default fallback confidence
+            )
     
     except Exception as e:
-        return f"Error: {str(e)}"
+        return RAGResponse(
+            answer=f"Error: {str(e)}",
+            sources=[],
+            confidence_score=0.0
+        )
     
 
 # Define a function to format source content with italics
@@ -116,49 +169,57 @@ def format_sources_with_styles(sources_text):
     
     return formatted_text
 
+# Update the process_query function to highlight the source content more clearly
 def process_query(query_text):
     """
     Process the query and split the response and sources into separate outputs.
     Returns tuple of (clean_response, sources_text)
     """
     try:
-        # Get the raw response from query_rag
-        full_response = query_rag(query_text)
+        # Get the structured response from query_rag
+        response_obj = query_rag(query_text)
         
-        # Split response if it contains "Sources:"
-        if "\nSources:" in full_response:
-            clean_response, sources_part = full_response.split("\nSources:", 1)
-            sources_text = f"Sources:\n{sources_part.strip()}"
-        else:
-            clean_response = full_response
-            sources_text = "No sources available"
-            
+        # Extract the answer text
+        clean_response = response_obj.answer
+        
+        # Format sources
+        sources_list = response_obj.sources
+        
         # Additionally, get the actual source passages
         embedding_function = get_embedding_function()
         db = Chroma(persist_directory=CHROMA_PATH, embedding_function=embedding_function)
         results = db.similarity_search_with_score(query_text, k=5)
         
         # Format source passages with content
-        detailed_sources = "Source Passages:\n\n"
+        detailed_sources = "<h3>Source Passages Used for Response</h3>"
         for i, (doc, score) in enumerate(results):
             source_id = doc.metadata.get("id", "Unknown")
             content = doc.page_content
-            detailed_sources += f"Source {i+1}: {source_id}\n"
-            detailed_sources += f"Content: {content}\n"
-            detailed_sources += f"Relevance: {score:.4f}\n\n"
-            detailed_sources += "-" * 40 + "\n\n"
+            
+            # Make it clearer which source contains which text
+            detailed_sources += f"<div style='margin:15px 0; padding:10px; border:1px solid #ddd; border-radius:5px;'>"
+            detailed_sources += f"<div style='font-weight:bold; color:#333;'>Source {i+1}: {source_id}</div>"
+            detailed_sources += f"<div style='margin:8px 0; padding:8px; background-color:#f9f9f9; border-left:4px solid #007bff; font-style:italic;'>{content}</div>"
+            detailed_sources += f"<div style='font-size:0.8em; color:#666;'>Relevance Score: {score:.4f}</div>"
+            detailed_sources += "</div>"
+        
+        # Add confidence score if available
+        if response_obj.confidence_score is not None:
+            detailed_sources += f"<div style='margin-top:15px; padding:8px; background-color:#e6f3ff; border-radius:5px;'><b>Response Confidence Score:</b> {response_obj.confidence_score:.2f}</div>"
         
         return clean_response, detailed_sources
         
     except Exception as e:
         error_message = f"Error processing query: {str(e)}"
         return error_message, "No sources available due to an error."
+        
 
+    
 # Modify process_query to apply formatting
 def enhanced_process_query(query_text):
+    """Process a query and return formatted response and sources"""
     response, sources = process_query(query_text)
-    formatted_sources = format_sources_with_styles(sources)
-    return response, formatted_sources
+    return response, sources 
 
 
 if __name__ == "__main__":

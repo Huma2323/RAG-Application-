@@ -8,19 +8,25 @@ import time
 import traceback
 
 # Import your RAG query function
-from query_data import enhanced_process_query
+from query_data import enhanced_process_query, query_rag, RAGResponse
 
-def evaluate_rag_system():
+
+def evaluate_rag_system(use_pydantic=True):
     """
     Evaluate RAG system by comparing its answers to ground truth answers.
     Calculates cosine similarity between generated and ground truth answers.
     Saves results to an Excel file with detailed statistics.
+    
+    Args:
+        use_pydantic (bool): If True, uses the direct Pydantic objects from query_rag
+                             If False, uses the enhanced_process_query function (legacy)
     """
     # Path for results
     output_dir = "evaluation_results"
     os.makedirs(output_dir, exist_ok=True)
     timestamp = time.strftime("%Y%m%d-%H%M%S")
-    output_file = os.path.join(output_dir, f"rag_evaluation_{timestamp}.xlsx")
+    method = "pydantic" if use_pydantic else "standard"
+    output_file = os.path.join(output_dir, f"rag_evaluation_{method}_{timestamp}.xlsx")
     
     # Initialize the embedding model for similarity calculation
     print("Loading embedding model...")
@@ -278,8 +284,9 @@ def evaluate_rag_system():
     }
 ]
     
-    # List to store results
+     # List to store results
     results = []
+    confidence_scores = []
     
     # Process each question
     print(f"Processing {len(questions_answers)} questions...")
@@ -290,8 +297,19 @@ def evaluate_rag_system():
         ground_truth = item["ground_truth"]
         
         try:
-            # Get model answer
-            answer, sources = enhanced_process_query(question)
+            # Get model answer using the appropriate method
+            if use_pydantic:
+                # Direct Pydantic approach
+                response_obj = query_rag(question)
+                answer = response_obj.answer
+                sources = response_obj.sources
+                confidence = response_obj.confidence_score
+                if confidence is not None:
+                    confidence_scores.append(confidence)
+            else:
+                # Legacy approach
+                answer, sources = enhanced_process_query(question)
+                confidence = None
             
             # Calculate cosine similarity
             embedding1 = model.encode([ground_truth])
@@ -299,15 +317,21 @@ def evaluate_rag_system():
             similarity = cosine_similarity(embedding1, embedding2)[0][0]
             
             # Add to results
-            results.append({
+            result_item = {
                 "PDF": pdf,
                 "Question Type": question_type,
                 "Question": question,
                 "Ground Truth Answer": ground_truth,
                 "Model Answer": answer,
-                "Sources": sources,
+                "Sources": sources if isinstance(sources, str) else str(sources),
                 "Cosine Similarity": similarity
-            })
+            }
+            
+            # Add confidence if available
+            if confidence is not None:
+                result_item["Confidence Score"] = confidence
+                
+            results.append(result_item)
             
         except Exception as e:
             print(f"Error processing question: {question}")
@@ -315,7 +339,7 @@ def evaluate_rag_system():
             traceback.print_exc()
             
             # Add to results with error message
-            results.append({
+            result_item = {
                 "PDF": pdf,
                 "Question Type": question_type,
                 "Question": question,
@@ -323,7 +347,12 @@ def evaluate_rag_system():
                 "Model Answer": f"ERROR: {str(e)}",
                 "Sources": "",
                 "Cosine Similarity": 0.0
-            })
+            }
+            
+            if use_pydantic:
+                result_item["Confidence Score"] = 0.0
+                
+            results.append(result_item)
     
     # Convert to DataFrame
     df = pd.DataFrame(results)
@@ -334,6 +363,11 @@ def evaluate_rag_system():
     if len(valid_df) > 0:
         avg_similarity = valid_df["Cosine Similarity"].mean()
         print(f"Average Cosine Similarity: {avg_similarity:.4f}")
+        
+        # Calculate average confidence if available
+        if confidence_scores:
+            avg_confidence = sum(confidence_scores) / len(confidence_scores)
+            print(f"Average Confidence Score: {avg_confidence:.4f}")
         
         # Group by PDF and calculate average similarity per PDF
         pdf_avg = valid_df.groupby("PDF")["Cosine Similarity"].mean().reset_index()
@@ -346,6 +380,11 @@ def evaluate_rag_system():
         print("\nAverage Cosine Similarity by Question Type:")
         for _, row in type_avg.iterrows():
             print(f"{row['Question Type']}: {row['Cosine Similarity']:.4f}")
+        
+        # Correlation between confidence and similarity if both available
+        if "Confidence Score" in valid_df.columns:
+            correlation = valid_df[["Cosine Similarity", "Confidence Score"]].corr().iloc[0, 1]
+            print(f"\nCorrelation between confidence scores and similarity: {correlation:.4f}")
     else:
         print("No valid similarities calculated")
     
@@ -357,14 +396,27 @@ def evaluate_rag_system():
         if len(valid_df) > 0:
             # Create summary sheet
             summary_data = {
-                "Metric": ["Overall Average", "Questions Processed", "Successful Queries", "Failed Queries"],
-                "Value": [
-                    avg_similarity,
-                    len(df),
-                    len(valid_df),
-                    len(df) - len(valid_df)
-                ]
+                "Metric": ["Overall Average Similarity", "Questions Processed", "Successful Queries", "Failed Queries"]
             }
+            summary_values = [
+                avg_similarity,
+                len(df),
+                len(valid_df),
+                len(df) - len(valid_df)
+            ]
+            
+            # Add confidence metrics if available
+            if confidence_scores:
+                summary_data["Metric"].extend([
+                    "Average Confidence Score", 
+                    "Confidence-Similarity Correlation"
+                ])
+                summary_values.extend([
+                    avg_confidence,
+                    correlation if "Confidence Score" in valid_df.columns else "N/A"
+                ])
+                
+            summary_data["Value"] = summary_values
             summary_df = pd.DataFrame(summary_data)
             summary_df.to_excel(writer, sheet_name="Summary", index=False)
             
@@ -373,9 +425,27 @@ def evaluate_rag_system():
             
             # Question type averages
             type_avg.to_excel(writer, sheet_name="Question Type Averages", index=False)
+            
+            # If we have confidence scores, add confidence analysis
+            if "Confidence Score" in valid_df.columns:
+                # Create bins for confidence scores
+                valid_df["Confidence Bin"] = pd.cut(
+                    valid_df["Confidence Score"], 
+                    bins=[0, 0.25, 0.5, 0.75, 1.0],
+                    labels=["0-0.25", "0.25-0.5", "0.5-0.75", "0.75-1.0"]
+                )
+                
+                # Calculate average similarity by confidence bin
+                conf_analysis = valid_df.groupby("Confidence Bin")["Cosine Similarity"].agg(
+                    ["mean", "count"]
+                ).reset_index()
+                
+                conf_analysis.columns = ["Confidence Range", "Average Similarity", "Number of Responses"]
+                conf_analysis.to_excel(writer, sheet_name="Confidence Analysis", index=False)
     
     print(f"Evaluation complete! Results saved to {output_file}")
     return output_file
 
 if __name__ == "__main__":
-    evaluate_rag_system()
+    # By default, use the Pydantic approach
+    evaluate_rag_system(use_pydantic=True)
